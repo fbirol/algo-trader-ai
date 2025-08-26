@@ -252,3 +252,62 @@ if st.sidebar.button("📊 Tüm Modelleri Karşılaştır"):
                 best = df_results.loc[df_results["total_return"].idxmax()]
                 st.success(f"🏆 En Yüksek Getiri: **{best['Model']}** ({best['total_return']}%)")
 
+if st.sidebar.button("🧠 Ensemble Strateji (MA + XGBoost + LSTM)"):
+    with st.spinner("Ensemble strateji hesaplanıyor..."):
+
+        from data.fetch_data import fetch_yfinance_data
+        from strategies.ensemble_strategy import generate_ensemble_signal
+        from utils.performance import backtest_strategy_with_equity
+        import matplotlib.pyplot as plt
+
+        # 1. Veri al
+        data_raw = fetch_yfinance_data(ticker, start_date, end_date)
+        if data_raw is None or data_raw.empty:
+            st.error("Veri alınamadı.")
+        else:
+            try:
+                # 2. Ensemble sinyal üret
+                final_signal, position, signals_df = generate_ensemble_signal(
+                    data_raw,
+                    ma_weight=1.0,
+                    xgb_weight=1.5,  # XGBoost'a biraz daha güven
+                    lstm_weight=1.2
+                )
+
+                # 3. Backtest
+                data_with_signal = data_raw.copy()
+                data_with_signal['signal'] = final_signal
+                perf = backtest_strategy_with_equity(data_with_signal, 'signal')
+
+                # 4. Sonuçları göster
+                st.subheader("📊 Ensemble Strateji Sonuçları")
+                st.success(f"Son Sermaye: ${perf['final_capital']:,.2f}")
+                st.info(f"Toplam Getiri: %{perf['total_return']:.2f}")
+                st.write(f"Sharpe Oranı: {perf['sharpe_ratio']:.3f}")
+                st.write(f"Win Rate: %{perf['win_rate']:.1f}")
+                st.write(f"İşlem Sayısı: {perf['trade_count']}")
+
+                # 5. Sinyal Karşılaştırması
+                st.subheader("🔍 Model Sinyal Karşılaştırması")
+                comparison = signals_df.iloc[-10:].copy()
+                comparison['Ensemble'] = final_signal.iloc[-10:]
+                st.dataframe(comparison)
+
+                # 6. Equity Curve
+                st.subheader("📈 Ensemble Equity Curve")
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(perf['equity_curve'], label="Ensemble Strateji", linewidth=2)
+                ax.set_title(f"{ticker} - Ensemble Strateji (MA + XGBoost + LSTM)")
+                ax.set_xlabel("Zaman")
+                ax.set_ylabel("Portföy Değeri ($)")
+                ax.legend()
+                ax.grid(True)
+                st.pyplot(fig)
+
+                # 7. En son sinyal
+                last_signal = "AL" if final_signal.iloc[-1] == 1 else "SAT"
+                st.markdown(f"### 🚦 En Son Sinyal: **{last_signal}**")
+
+            except Exception as e:
+                st.error(f"Ensemble hatası: {e}")
+
