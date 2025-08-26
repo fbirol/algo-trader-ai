@@ -1,4 +1,5 @@
 # strategies/lstm_strategy.py
+import os
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
@@ -66,11 +67,9 @@ def train_lstm_model(data, window_size=60, epochs=50, batch_size=32, save_model_
 
     # Model ve scaler kaydet
     if save_model_path:
-        model.save(save_model_path)
-        scaler_path = save_model_path.replace(".h5", "_scaler.pkl")
-        joblib.dump(scaler, scaler_path)
+        model.save("models/lstm_model.h5")
+        joblib.dump(scaler, "models/lstm_model_scaler.pkl")
         print(f"LSTM modeli kaydedildi: {save_model_path}")
-        print(f"Scaler kaydedildi: {scaler_path}")
 
     return model, scaler, X_test, y_test
 

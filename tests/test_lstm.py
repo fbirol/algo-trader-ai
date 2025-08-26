@@ -14,7 +14,7 @@ model, scaler, X_test, y_test = train_lstm_model(
     data,
     window_size=60,
     epochs=5,  # Hızlı test için az
-    save_model_path="lstm_model.h5"
+    save_model_path = os.path.join("models", "lstm_model.h5")
 )
 
 # Son fiyatı tahmin et

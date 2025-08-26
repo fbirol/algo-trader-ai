@@ -1,4 +1,4 @@
-# strategies/xgboost_strategy.py
+import os
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -106,7 +106,8 @@ def train_xgboost_model(data, features, save_model_path=None):
 
     # Modeli kaydet (isteğe bağlı)
     if save_model_path:
-        joblib.dump(model, save_model_path)
+        model_path = os.path.join("models", "xgboost_model.pkl")
+        joblib.dump(model, model_path)
         print(f"Model kaydedildi: {save_model_path}")
 
     return model, acc, clean_data
