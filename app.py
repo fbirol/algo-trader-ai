@@ -1,184 +1,273 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
+# Modüller
 from data.fetch_data import fetch_yfinance_data
-from strategies.ma_crossover import generate_signals
-from utils.performance import backtest_strategy, calculate_performance
-from utils.performance import plot_strategy
+from data.load_custom_txt import load_custom_txt
+from data.load_csv import load_csv_data
+from strategies.ma_crossover import MACrossoverStrategy
+from strategies.xgboost_strategy import add_features as xgb_add_features
+from strategies.xgboost_strategy import train_xgboost_model, predict_signal
+from strategies.lstm_strategy import train_lstm_model, predict_next_price
+from strategies.ensemble_strategy import generate_ensemble_signal
+from backtester.core import Backtester, BacktestConfig
+from optimizer.grid_search import optimize
+from optimizer.walk_forward import walk_forward_analysis
+import joblib
+from tensorflow.keras.models import load_model
+import os
 
-st.title("📊 Algoritmik Ticaret Simülatörü")
-st.write("Hareketli Ortalama Kesişimi (Golden Cross) Stratejisi")
+# ---------------------------------------------------------------------
+# Sayfa Yapılandırması
+# ---------------------------------------------------------------------
+st.set_page_config(
+    page_title="AlgoTrader AI",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Sidebar
-ticker = st.sidebar.text_input("Hisse Sembolü", "SPY")
-start_date = st.sidebar.date_input("Başlangıç Tarihi", pd.to_datetime("2010-01-01"))
-end_date = st.sidebar.date_input("Bitiş Tarihi", pd.to_datetime("2024-01-01"))
+st.title("📈 AlgoTrader AI")
+st.markdown("### **Yapay Zekâ Destekli Algoritmik Ticaret Simülatörü**")
+st.markdown("---")
 
-short_window = st.sidebar.slider("Kısa MA (gün)", 10, 100, 50)
-long_window = st.sidebar.slider("Uzun MA (gün)", 100, 200, 200)
+# ---------------------------------------------------------------------
+# Yardımcı Fonksiyon: Veri Yükleme
+# ---------------------------------------------------------------------
+@st.cache_data
+def get_data(source_type, filepath_or_ticker, start_date=None, end_date=None):
+    """
+    Ortak veri yükleme fonksiyonu.
+    """
+    if source_type == "yfinance":
+        data = fetch_yfinance_data(filepath_or_ticker, start_date, end_date)
+    elif source_type == "csv":
+        data = load_csv_data(filepath_or_ticker)
+    elif source_type == "txt":
+        data = load_custom_txt(filepath_or_ticker)
+    else:
+        raise ValueError("Geçersiz veri kaynağı")
 
-if st.button("Stratejiyi Çalıştır"):
-    with st.spinner("Veri indiriliyor ve analiz yapılıyor..."):
-        # 1. Veri al
-        data = fetch_yfinance_data(ticker, start_date, end_date)
-        if data is None or data.empty:
-            st.error("Veri alınamadı. Sembolü kontrol edin.")
+    if data is None or data.empty:
+        return None
+
+    # Tarih filtresi
+    if start_date is not None:
+        data = data[data.index >= pd.to_datetime(start_date)]
+    if end_date is not None:
+        data = data[data.index <= pd.to_datetime(end_date)]
+
+    return data if not data.empty else None
+
+# ---------------------------------------------------------------------
+# Sidebar: Genel Ayarlar
+# ---------------------------------------------------------------------
+st.sidebar.header("⚙️ Genel Ayarlar")
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 Veri Kaynağı")
+
+data_source = st.sidebar.radio("Veri Kaynağı", ["Yahoo Finance", "CSV Yükle", "Özel TXT Yükle"])
+
+data = None
+source_type = None
+filepath_or_ticker = None
+
+# Veri yükleme ve tarih aralığı
+if data_source == "Yahoo Finance":
+    ticker = st.sidebar.text_input("Hisse Sembolü", "SPY")
+    start_date = st.sidebar.date_input("Başlangıç", pd.to_datetime("2020-01-01"), key="start_yf")
+    end_date = st.sidebar.date_input("Bitiş", pd.to_datetime("2023-01-01"), key="end_yf")
+    source_type = "yfinance"
+    filepath_or_ticker = ticker
+
+elif data_source == "CSV Yükle":
+    uploaded_file = st.sidebar.file_uploader("CSV Yükle", type="csv", key="csv_uploader")
+    if uploaded_file is not None:
+        filepath = "temp_uploaded_data.csv"
+        with open(filepath, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        filepath_or_ticker = filepath
+        source_type = "csv"
+        data = get_data(source_type, filepath_or_ticker, None, None)
+        if data is not None:
+            start_date = st.sidebar.date_input("Başlangıç (isteğe bağlı)", value=None, key="start_csv")
+            end_date = st.sidebar.date_input("Bitiş (isteğe bağlı)", value=None, key="end_csv")
         else:
-            # 2. Sinyal üret
-            data = generate_signals(data, short_window, long_window)
+            st.error("CSV verisi yüklenemedi.")
 
-            # 3. Backtest
-            results = backtest_strategy(data, initial_capital=10000)
-            final_capital = results["final_capital"]
-            trades = results["trades"]
+else:  # Özel TXT Yükle
+    uploaded_file = st.sidebar.file_uploader("TXT Yükle", type="txt", key="txt_uploader")
+    if uploaded_file is not None:
+        filepath = "temp_uploaded_data.txt"
+        with open(filepath, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        filepath_or_ticker = filepath
+        source_type = "txt"
+        data = get_data(source_type, filepath_or_ticker, None, None)
+        if data is not None:
+            start_date = st.sidebar.date_input("Başlangıç (isteğe bağlı)", value=None, key="start_txt")
+            end_date = st.sidebar.date_input("Bitiş (isteğe bağlı)", value=None, key="end_txt")
+        else:
+            st.error("TXT verisi yüklenemedi.")
 
-            # 4. Performans metrikleri
-            perf_metrics = calculate_performance(data, trades)
+# Veri aralığı bilgisi
+if data is not None and not data.empty:
+    st.sidebar.info(f"Veri aralığı: {data.index.min():%Y-%m-%d} → {data.index.max():%Y-%m-%d}")
 
-            # 5. Görselleştir
-            fig = plot_strategy(data, ticker, short_window, long_window)
-            st.pyplot(fig)
+# Veriyi filtrele (tarih bazlı)
+if filepath_or_ticker and source_type:
+    data = get_data(source_type, filepath_or_ticker, start_date, end_date)
+    if data is not None and not data.empty:
+        st.success(f"✅ Veri yüklendi. {len(data)} satır.")
+    else:
+        st.error("❌ Veri yüklenemedi veya boş.")
 
-            # 6. Sonuçları göster
-            st.success(f"Son Sermaye: ${final_capital:,.2f}")
-            st.info(f"Toplam Getiri: %{perf_metrics['total_return']:.2f}")
-            st.write(f"Sharpe Oranı: {perf_metrics['sharpe_ratio']:.2f}")
-            st.write(f"Toplam İşlem Sayısı: {len(trades)}")
+# Genel ayarlar
+st.sidebar.markdown("---")
+currency = st.sidebar.selectbox("Para Birimi", ["USD", "TL"], index=0)
+mode = st.sidebar.selectbox("Ticaret Modu", ["long_only", "long_short"], index=0)
+commission = st.sidebar.slider("Komisyon (%)", 0.0, 1.0, 0.1) / 100
+slippage = st.sidebar.slider("Slippage (%)", 0.0, 1.0, 0.05) / 100
+initial_capital = st.sidebar.number_input("Başlangıç Sermayesi", 1000, 100000, 10000)
 
-# app.py içine yeni bir sekme ekle
-with st.sidebar:
-    st.markdown("---")
-    ai_enabled = st.checkbox("🤖 AI Modunu Etkinleştir")
+# ---------------------------------------------------------------------
+# Sekmeler
+# ---------------------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Temel Strateji",
+    "🤖 XGBoost AI",
+    "🧠 LSTM Tahmini",
+    "⚖️ Model Karşılaştırması",
+    "🎛️ Ensemble & Optimizasyon",
+    "🔍 Walk-Forward Analiz"
+])
 
-if ai_enabled:
+# ---------------------------------------------------------------------
+# TAB 1: Temel MA Stratejisi
+# ---------------------------------------------------------------------
+with tab1:
+    st.subheader("📊 Hareketli Ortalama (Golden Cross) Stratejisi")
+    short_win = st.slider("Kısa MA (gün)", 5, 100, 50, key="ma_short_tab1")
+    long_win = st.slider("Uzun MA (gün)", 50, 200, 200, key="ma_long_tab1")
+
+    if st.button("📌 Stratejiyi Çalıştır", key="run_ma"):
+        if data is None or data.empty:
+            st.error("❌ Veri alınamadı.")
+        else:
+            strategy = MACrossoverStrategy(short_window=short_win, long_window=long_win)
+            config = BacktestConfig(initial_capital=initial_capital, commission=commission, slippage=slippage, mode=mode, currency=currency)
+            backtester = Backtester(config)
+            results = backtester.run(data, strategy)
+            perf = results['performance']
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Son Sermaye", f"${perf['final_equity']:,.2f}")
+            col2.metric("Toplam Getiri", f"%{perf['total_return']:.2f}")
+            col3.metric("Sharpe Oranı", f"{perf['sharpe_ratio']:.3f}")
+            col4.metric("Max Drawdown", f"%{perf['max_drawdown']:.2f}")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=data.index, y=results['equity_curve'], mode='lines', name='Portföy Değeri'))
+            fig.update_layout(title="Portföy Büyümesi (Equity Curve)", xaxis_title="Tarih", yaxis_title="Değer", hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------------------
+# TAB 2: XGBoost AI
+# ---------------------------------------------------------------------
+with tab2:
     st.subheader("🤖 XGBoost ile AI Sinyal Tahmini")
+    if st.button("🧠 Model Eğit ve Tahmin Et"):
+        if data is None or data.empty:
+            st.error("❌ Veri alınamadı.")
+        else:
+            try:
+                data_feat = xgb_add_features(data)
+                features = ['MA5', 'MA10', 'MA20', 'MA50', 'RSI', 'MACD', 'MACD_signal', 'Volatility', 'Price_Change', 'Volume_Change', 'BB_width']
+                model, acc, clean_data = train_xgboost_model(data_feat, features)
+                latest = clean_data[features].iloc[-1:].values.reshape(1, -1)
+                signal, confidence = predict_signal(model, latest)
 
-    if st.button("AI Modeli Eğit ve Tahmin Et"):
-        with st.spinner("AI modeli eğitiliyor..."):
-            from strategies.xgboost_strategy import add_features, train_xgboost_model, predict_signal
+                st.success(f"**Tahmin: {signal}**")
+                st.info(f"**Güven: %{confidence * 100:.1f}**")
+                st.write(f"Model Doğruluğu: %{acc * 100:.1f}")
+            except Exception as e:
+                st.error(f"❌ XGBoost hatası: {e}")
 
-            # 1. Veri al
-            data_raw = fetch_yfinance_data(ticker, start_date, end_date)
-            if data_raw is None or data_raw.empty:
-                st.error("Veri alınamadı.")
-            else:
-                # 2. Özellik ekle
-                data_featured = add_features(data_raw)
+# ---------------------------------------------------------------------
+# TAB 3: LSTM Tahmini
+# ---------------------------------------------------------------------
+with tab3:
+    st.subheader("🧠 LSTM ile Fiyat Tahmini")
+    if st.button("🔮 LSTM Modeli Eğit ve Tahmin Et"):
+        if data is None or data.empty:
+            st.error("❌ Veri alınamadı.")
+        else:
+            try:
+                model, scaler, _, _ = train_lstm_model(data, window_size=60, epochs=5, save_model_path="models/lstm_model.h5")
+                last_60 = data['close'].values[-60:]
+                pred = predict_next_price(model, scaler, last_60, 60)
+                current = data['close'].iloc[-1]
+                change_pct = (pred - current) / current * 100
 
-                # 3. Özellik listesi
-                features = [
-                    'MA5', 'MA10', 'MA20', 'MA50',
-                    'RSI', 'MACD', 'MACD_signal',
-                    'Volatility', 'Price_Change', 'Volume_Change',
-                    'BB_width'
-                ]
+                col1, col2 = st.columns(2)
+                col1.metric("Geçerli Fiyat", f"${current:.2f}")
+                col2.metric("Tahmini Fiyat", f"${pred:.2f}")
+                st.write(f"**Tahmini Getiri: %{change_pct:.2f}**")
+                if change_pct > 0:
+                    st.success("✅ **Sinyal: AL**")
+                else:
+                    st.warning("⚠️ **Sinyal: SAT**")
+            except Exception as e:
+                st.error(f"❌ LSTM hatası: {e}")
 
-                # 4. Model eğit
-                try:
-                    model, acc, clean_data = train_xgboost_model(data_featured, features)
+# ---------------------------------------------------------------------
+# TAB 4: Model Karşılaştırması
+# ---------------------------------------------------------------------
+with tab4:
+    st.subheader("⚖️ Üç Modelin Karşılaştırması")
 
-                    # 5. Son sinyali tahmin et
-                    latest_row = clean_data[features].iloc[-1:].values.reshape(1, -1)
-                    signal, confidence = predict_signal(model, latest_row)
-
-                    # 6. Göster
-                    st.success(f"🤖 Tahmin: **{signal}**")
-                    st.info(f"Güven: %{confidence*100:.1f}")
-                    st.write(f"Model Doğruluğu: %{acc*100:.1f}")
-
-                except Exception as e:
-                    st.error(f"Model hatası: {e}")
-
-if st.checkbox("🧠 LSTM ile Fiyat Tahmini"):
-    st.subheader("🧠 LSTM Zaman Serisi Tahmini")
-
-    if st.button("LSTM Modeli Eğit ve Tahmin Et"):
-        with st.spinner("LSTM modeli eğitiliyor..."):
-            from strategies.lstm_strategy import train_lstm_model, predict_next_price
-
-            # Veri al
-            data_raw = fetch_yfinance_data(ticker, start_date, end_date)
-            if data_raw is None or data_raw.empty:
-                st.error("Veri alınamadı.")
-            else:
-                try:
-                    # Model eğit
-                    model, scaler, X_test, y_test = train_lstm_model(
-                        data_raw,
-                        window_size=60,
-                        epochs=10,  # Daha hızlı test
-                        save_model_path="lstm_model.h5"
-                    )
-
-                    # Tahmin yap
-                    window_size = 60
-                    last_60 = data_raw['close'].values[-window_size:]
-                    pred = predict_next_price(model, scaler, last_60, window_size)
-                    current = data_raw['close'].iloc[-1]
-                    change_pct = (pred - current) / current * 100
-
-                    # Göster
-                    st.success(f"Tahmini Fiyat: ${pred:.2f}")
-                    st.info(f"Geçerli Fiyat: ${current:.2f}")
-                    st.write(f"Tahmini Getiri: %{change_pct:.2f}")
-
-                    if change_pct > 0:
-                        st.write("🤖 **Sinyal: AL** (Yukarı yönlü hareket bekleniyor)")
-                    else:
-                        st.write("🤖 **Sinyal: SAT/Bekle** (Aşağı yönlü hareket bekleniyor)")
-
-                except Exception as e:
-                    st.error(f"LSTM hatası: {e}")
-
-if st.sidebar.button("📊 Tüm Modelleri Karşılaştır"):
-    with st.spinner("Modeller karşılaştırılıyor..."):
-
-        from data.fetch_data import fetch_yfinance_data
-        from strategies.ma_crossover import generate_signals as ma_generate
-        from strategies.xgboost_strategy import add_features, train_xgboost_model
-        from strategies.lstm_strategy import prepare_lstm_data, predict_next_price
-        import joblib
-        from utils.performance import backtest_strategy_with_equity
-        import matplotlib.pyplot as plt
-
-        # 1. Veri al
-        data_raw = fetch_yfinance_data(ticker, start_date, end_date)
-        if data_raw is None or data_raw.empty:
-            st.error("Veri alınamadı.")
+    if st.button("📊 Karşılaştır"):
+        if data is None or data.empty:
+            st.error("❌ Veri alınamadı.")
         else:
             results = []
 
             # ----------------------------
             # 1. MA Crossover Stratejisi
             # ----------------------------
-            data_ma = ma_generate(data_raw.copy())
-            perf_ma = backtest_strategy_with_equity(data_ma, signal_column='signal')
-            results.append({
-                "Model": "MA Crossover",
-                **perf_ma
-            })
+            try:
+                strategy_ma = MACrossoverStrategy(short_window=50, long_window=200)
+                config = BacktestConfig(initial_capital=initial_capital, commission=commission, mode=mode)
+                backtester = Backtester(config)
+                data_with_signal = data.copy()
+                data_with_signal['signal'] = strategy_ma.generate_signals(data)
+                result_ma = backtester.run(data_with_signal, strategy_ma)
+                perf_ma = result_ma['performance']
+                results.append({"Model": "MA Crossover", **perf_ma})
+            except Exception as e:
+                st.warning(f"MA hatası: {e}")
 
             # ----------------------------
             # 2. XGBoost Stratejisi
             # ----------------------------
             try:
-                data_xgb = add_features(data_raw.copy())
+                data_xgb = xgb_add_features(data.copy())
                 features = ['MA5', 'MA10', 'MA20', 'MA50', 'RSI', 'MACD', 'MACD_signal',
                            'Volatility', 'Price_Change', 'Volume_Change', 'BB_width']
-
-                # Eğitim (train_xgboost_model zaten app.py'de var)
                 model, acc, clean_data = train_xgboost_model(data_xgb, features)
                 preds = model.predict(clean_data[features])
-                data_xgb = data_xgb.iloc[len(data_xgb) - len(preds):].copy()
-                data_xgb['signal'] = preds
+                signal_series = pd.Series(preds, index=clean_data.index)
 
-                perf_xgb = backtest_strategy_with_equity(data_xgb, 'signal')
-                results.append({
-                    "Model": "XGBoost",
-                    **perf_xgb
-                })
+                strategy_dummy = type('DummyStrategy', (), {
+                    'generate_signals': lambda d: signal_series.reindex(d.index, fill_value=0)
+                })()
+
+                backtester = Backtester(BacktestConfig(initial_capital=initial_capital, commission=commission, mode=mode))
+                result_xgb = backtester.run(data_xgb, strategy_dummy)
+                perf_xgb = result_xgb['performance']
+                results.append({"Model": "XGBoost", **perf_xgb})
             except Exception as e:
                 st.warning(f"XGBoost hatası: {e}")
 
@@ -189,30 +278,28 @@ if st.sidebar.button("📊 Tüm Modelleri Karşılaştır"):
                 from tensorflow.keras.models import load_model
                 lstm_model = load_model("models/lstm_model.h5")
                 scaler = joblib.load("models/lstm_model_scaler.pkl")
-
-                data_lstm = data_raw.copy()
                 window_size = 60
-                X, y, _ = prepare_lstm_data(data_lstm, window_size=window_size)
 
-                # Tahminler
-                preds_scaled = lstm_model.predict(X)
-                preds = scaler.inverse_transform(preds_scaled)
-                actuals = scaler.inverse_transform(y.reshape(-1, 1))
-
-                # Sinyal: tahmin > önceki fiyat → AL
+                # Tahmin üret
+                dataset = data['close'].values.reshape(-1, 1)
+                scaled_data = scaler.transform(dataset)
                 signals = []
-                prices = data_lstm['close'].values[window_size:]
-                for i in range(len(preds)):
-                    signals.append(1 if preds[i] > prices[i] else 0)
+                for i in range(window_size, len(scaled_data)):
+                    X = scaled_data[i-window_size:i, 0].reshape(1, window_size, 1)
+                    pred = lstm_model.predict(X, verbose=0)[0, 0]
+                    current = scaled_data[i, 0]
+                    signals.append(1 if pred > current else 0)
 
-                data_lstm = data_lstm.iloc[window_size:].copy()
-                data_lstm['signal'] = signals
+                signal_series = pd.Series(signals, index=data.index[window_size:])
 
-                perf_lstm = backtest_strategy_with_equity(data_lstm, 'signal')
-                results.append({
-                    "Model": "LSTM",
-                    **perf_lstm
-                })
+                strategy_dummy = type('DummyStrategy', (), {
+                    'generate_signals': lambda d: signal_series.reindex(d.index, fill_value=0)
+                })()
+
+                backtester = Backtester(BacktestConfig(initial_capital=initial_capital, commission=commission, mode=mode))
+                result_lstm = backtester.run(data.iloc[window_size:], strategy_dummy)
+                perf_lstm = result_lstm['performance']
+                results.append({"Model": "LSTM", **perf_lstm})
             except Exception as e:
                 st.warning(f"LSTM hatası: {e}")
 
@@ -229,85 +316,86 @@ if st.sidebar.button("📊 Tüm Modelleri Karşılaştır"):
                 df_results["max_drawdown"] = df_results["max_drawdown"].round(2)
                 df_results["win_rate"] = df_results["win_rate"].round(1)
 
-                st.subheader("📊 Model Karşılaştırma Tablosu")
                 st.dataframe(df_results.style.format({
                     "total_return": "{}%",
                     "max_drawdown": "{}%",
                     "win_rate": "{}%",
-                }).background_gradient(subset=["total_return"], cmap="RdYlGn", vmin=-20, vmax=50))
+                }).background_gradient(subset=["total_return"], cmap="RdYlGn"))
 
-                # Equity Curve Karşılaştırması
-                st.subheader("📈 Equity Curve Karşılaştırması")
-                fig, ax = plt.subplots(figsize=(12, 6))
-                for res in results:
-                    ax.plot(res['equity_curve'], label=res['Model'])
-                ax.set_title(f"{ticker} - Strateji Karşılaştırması")
-                ax.set_xlabel("Zaman (Gün)")
-                ax.set_ylabel("Portföy Değeri ($)")
-                ax.legend()
-                ax.grid(True)
-                st.pyplot(fig)
+                # Equity Curve
+                fig = go.Figure()
+                for r in results:
+                    fig.add_trace(go.Scatter(y=r['equity_curve'], name=r['Model']))
+                fig.update_layout(title="Equity Curve Karşılaştırması", xaxis_title="Zaman", yaxis_title="Portföy Değeri")
+                st.plotly_chart(fig)
 
-                # En iyi model
-                best = df_results.loc[df_results["total_return"].idxmax()]
-                st.success(f"🏆 En Yüksek Getiri: **{best['Model']}** ({best['total_return']}%)")
+# ---------------------------------------------------------------------
+# TAB 5: Ensemble & Optimizasyon
+# ---------------------------------------------------------------------
+with tab5:
+    col1, col2 = st.columns(2)
 
-if st.sidebar.button("🧠 Ensemble Strateji (MA + XGBoost + LSTM)"):
-    with st.spinner("Ensemble strateji hesaplanıyor..."):
-
-        from data.fetch_data import fetch_yfinance_data
-        from strategies.ensemble_strategy import generate_ensemble_signal
-        from utils.performance import backtest_strategy_with_equity
-        import matplotlib.pyplot as plt
-
-        # 1. Veri al
-        data_raw = fetch_yfinance_data(ticker, start_date, end_date)
-        if data_raw is None or data_raw.empty:
-            st.error("Veri alınamadı.")
-        else:
+    with col1:
+        st.subheader("🧠 Ensemble Strateji")
+        if st.button("Ensemble Hesapla"):
             try:
-                # 2. Ensemble sinyal üret
-                final_signal, position, signals_df = generate_ensemble_signal(
-                    data_raw,
-                    ma_weight=1.0,
-                    xgb_weight=1.5,  # XGBoost'a biraz daha güven
-                    lstm_weight=1.2
-                )
-
-                # 3. Backtest
-                data_with_signal = data_raw.copy()
+                final_signal, _, _ = generate_ensemble_signal(data)
+                # Sinyali DataFrame'e ekle
+                data_with_signal = data.copy()
                 data_with_signal['signal'] = final_signal
-                perf = backtest_strategy_with_equity(data_with_signal, 'signal')
+                # Backtest
+                config = BacktestConfig(initial_capital=initial_capital, commission=commission, mode=mode)
+                backtester = Backtester(config)
+                result = backtester.run(data_with_signal, lambda d: d['signal'])  # Basit strateji
+                perf = result['performance']
 
-                # 4. Sonuçları göster
-                st.subheader("📊 Ensemble Strateji Sonuçları")
-                st.success(f"Son Sermaye: ${perf['final_capital']:,.2f}")
-                st.info(f"Toplam Getiri: %{perf['total_return']:.2f}")
-                st.write(f"Sharpe Oranı: {perf['sharpe_ratio']:.3f}")
-                st.write(f"Win Rate: %{perf['win_rate']:.1f}")
-                st.write(f"İşlem Sayısı: {perf['trade_count']}")
-
-                # 5. Sinyal Karşılaştırması
-                st.subheader("🔍 Model Sinyal Karşılaştırması")
-                comparison = signals_df.iloc[-10:].copy()
-                comparison['Ensemble'] = final_signal.iloc[-10:]
-                st.dataframe(comparison)
-
-                # 6. Equity Curve
-                st.subheader("📈 Ensemble Equity Curve")
-                fig, ax = plt.subplots(figsize=(12, 6))
-                ax.plot(perf['equity_curve'], label="Ensemble Strateji", linewidth=2)
-                ax.set_title(f"{ticker} - Ensemble Strateji (MA + XGBoost + LSTM)")
-                ax.set_xlabel("Zaman")
-                ax.set_ylabel("Portföy Değeri ($)")
-                ax.legend()
-                ax.grid(True)
-                st.pyplot(fig)
-
-                # 7. En son sinyal
-                last_signal = "AL" if final_signal.iloc[-1] == 1 else "SAT"
-                st.markdown(f"### 🚦 En Son Sinyal: **{last_signal}**")
-
+                st.metric("Son Sermaye", f"${perf['final_equity']:,.2f}")
+                st.metric("Getiri", f"%{perf['total_return']:.2f}")
+                st.metric("Sharpe", f"{perf['sharpe_ratio']:.3f}")
             except Exception as e:
                 st.error(f"Ensemble hatası: {e}")
+                
+    with col2:
+        st.subheader("🎛️ Parametre Optimizasyonu")
+        if st.button("Optimize Et"):
+            try:
+                param_ranges = {"short_window": [10, 20, 50], "long_window": [50, 100, 200]}
+                config = BacktestConfig(initial_capital=initial_capital, commission=commission)
+                results_df = optimize(MACrossoverStrategy, data, param_ranges, config, mode=mode)
+                st.dataframe(results_df.head(10))
+                csv = results_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 CSV İndir", csv, "optimization.csv", "text/csv")
+            except Exception as e:
+                st.error(f"Optimizasyon hatası: {e}")
 
+# ---------------------------------------------------------------------
+# TAB 6: Walk-Forward Analiz
+# ---------------------------------------------------------------------
+with tab6:
+    st.subheader("🔍 Walk-Forward Analiz")
+    if st.button("WFA Çalıştır"):
+        if data is None or data.empty:
+            st.error("❌ Veri alınamadı.")
+        else:
+            try:
+                results_df = walk_forward_analysis(
+                    MACrossoverStrategy,
+                    data,
+                    warmup_period="365 days",
+                    window_size="365 days",
+                    step_size="90 days",
+                    config_kwargs={
+                        "initial_capital": initial_capital,
+                        "commission": commission,
+                        "mode": mode,
+                        "currency": currency
+                    }
+                )
+                st.dataframe(results_df)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=results_df['test_period'], y=results_df['test_return'], mode='lines+markers'))
+                fig.update_layout(title="Test Dönemleri (Getiri %)", xaxis_title="Test Dönemi", yaxis_title="Getiri (%)")
+                st.plotly_chart(fig)
+                st.info(f"Ortalama Getiri: %{results_df['test_return'].mean():.2f}")
+            except Exception as e:
+                st.error(f"WFA hatası: {e}")

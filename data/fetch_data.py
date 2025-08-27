@@ -1,11 +1,10 @@
 # data/fetch_data.py
+from typing import Optional
 import yfinance as yf
 import pandas as pd
 
-def fetch_yfinance_data(ticker, start, end):
-    """
-    Yahoo Finance'ten veri indir ve temizle.
-    """
+def fetch_yfinance_data(ticker: str, start, end) -> Optional[pd.DataFrame]:
+    """Yahoo Finance'ten veri indir."""
     try:
         data = yf.download(ticker, start=start, end=end)
         if data.empty:
